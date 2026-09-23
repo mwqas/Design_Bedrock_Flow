@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Learning-stack backend for the Amazon Bedrock customer-support project:
+  DynamoDB ticket table, ticket Lambda, wrapper Lambda, and IAM roles.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: online-shop-support
+    AllowedPattern: '[a-zA-Z0-9-]+'
+
+Resources:
+  BugReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectPrefix}-bug-reports'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+
+  TicketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-ticket-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WriteBugReports
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt BugReportsTable.Arn
+
+  CreateBugReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectPrefix}-create-bug-report'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TicketLambdaRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BugReportsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          required = ("description", "stepsToReproduce", "environment")
+
+          def lambda_handler(event, context):
+              if isinstance(event, str):
+                  event = json.loads(event)
+
+              missing = [k for k in required if not str(event.get(k, "")).strip()]
+              if missing:
+                  return {"statusCode": 400, "error": "MISSING_FIELDS", "missingFields": missing}
+
+              ticket_id = str(uuid.uuid4())
+              item = {
+                  "ticketId": ticket_id,
+                  "createdAt": datetime.now(timezone.utc).isoformat(),
+                  "description": str(event["description"]).strip(),
+                  "stepsToReproduce": str(event["stepsToReproduce"]).strip(),
+                  "environment": str(event["environment"]).strip(),
+                  "status": "OPEN",
+              }
+              table.put_item(Item=item)
+              return {"statusCode": 200, "ticketId": ticket_id, "status": "OPEN"}
+
+  WrapperLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-wrapper-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeTicketLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CreateBugReportFunction.Arn
+
+  BedrockFlowBugWrapper:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectPrefix}-flow-bug-wrapper'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt WrapperLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TARGET_FUNCTION: !Ref CreateBugReportFunction
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          client = boto3.client("lambda")
+          target = os.environ["TARGET_FUNCTION"]
+
+          def find_value(obj, keys):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      if k in keys:
+                          return v
+                  for v in obj.values():
+                      hit = find_value(v, keys)
+                      if hit is not None:
+                          return hit
+              if isinstance(obj, list):
+                  for item in obj:
+                      hit = find_value(item, keys)
+                      if hit is not None:
+                          return hit
+              return None
+
+          def find_ticket_id(obj):
+              if isinstance(obj, dict):
+                  if obj.get("ticketId"):
+                      return obj["ticketId"]
+                  for v in obj.values():
+                      hit = find_ticket_id(v)
+                      if hit:
+                          return hit
+              if isinstance(obj, list):
+                  for item in obj:
+                      hit = find_ticket_id(item)
+                      if hit:
+                          return hit
+              return None
+
+          def lambda_handler(event, context):
+              raw = find_value(event, {"bug_payload", "document"})
+              if raw is None:
+                  raw = event
+              if isinstance(raw, str):
+                  try:
+                      bug = json.loads(raw)
+                  except json.JSONDecodeError:
+                      return raw
+              else:
+                  bug = raw
+
+              if str(bug.get("status", "")).upper() == "NEEDS_INFO":
+                  return bug.get("message", "Please provide the missing bug details.")
+
+              required = ("description", "stepsToReproduce", "environment")
+              missing = [k for k in required if not str(bug.get(k, "")).strip()]
+              if missing:
+                  return "Please provide the missing information: " + ", ".join(missing) + "."
+
+              payload = {k: bug[k] for k in required}
+              response = client.invoke(
+                  FunctionName=target,
+                  InvocationType="RequestResponse",
+                  Payload=json.dumps(payload).encode("utf-8"),
+              )
+              result = json.loads(response["Payload"].read() or "{}")
+              ticket_id = find_ticket_id(result)
+
+              if response.get("FunctionError"):
+                  return "The support ticket could not be created. Please contact human support."
+
+              if ticket_id:
+                  return (
+                      "Your bug report has been created successfully. "
+                      f"Your ticket ID is {ticket_id}. The ticket status is OPEN."
+                  )
+
+              return "The bug report was submitted, but the ticket ID could not be retrieved."
+
+Outputs:
+  BugReportsTableName:
+    Value: !Ref BugReportsTable
+  CreateBugReportFunctionName:
+    Value: !Ref CreateBugReportFunction
+  WrapperFunctionName:
+    Value: !Ref BedrockFlowBugWrapper
