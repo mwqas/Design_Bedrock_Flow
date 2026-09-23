@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Local environment / credentials
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+
+# Generated evaluation output
+output_eval_dataset.jsonl
+evaluation-results/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Packaging
+*.zip
+dist/
+build/
+
+# Optional local screenshots with account-specific data
+private-screenshots/
